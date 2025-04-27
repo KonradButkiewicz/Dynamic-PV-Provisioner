@@ -1,90 +1,272 @@
-package main
+package controller
 
 import (
-	"flag"
-	"os"
+	"context"
+	"fmt"
+	"path/filepath"
+	"time"
 
-	// Import all Kubernetes client auth plugins
-	_ "k8s.io/client-go/plugin/pkg/client/auth"
-
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
-	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
-
-	"github.com/example/pv-provisioner/internal/controller"
-	// +kubebuilder:scaffold:imports
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 )
 
-var (
-	scheme   = runtime.NewScheme()
-	setupLog = ctrl.Log.WithName("setup")
-)
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;create;watch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;create;watch
 
-func init() {
-	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-	// +kubebuilder:scaffold:scheme
+// PersistentVolumeProvisionerReconciler is a controller responsible for dynamically
+// creating PersistentVolumes for PersistentVolumeClaims in the Pending state
+// using local HostPath directories on selected cluster nodes.
+type PersistentVolumeProvisionerReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+	// PvPath specifies the base path on the host where volumes will be created
+	PvPath string
 }
 
-func main() {
-	var metricsAddr string
-	var enableLeaderElection bool
-	var probeAddr string
-	var pvPath string
+// hostPathTypePtr converts a HostPathType value to a pointer to that value,
+// which is required by the Kubernetes API for the Type field in HostPathVolumeSource.
+func hostPathTypePtr(hostPathType corev1.HostPathType) *corev1.HostPathType {
+	return &hostPathType
+}
 
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
-		"Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager.")
-	flag.StringVar(&pvPath, "pv-path", "/k8s-storage", "The base path where PersistentVolumes will be created.")
+// generatePVName generates a name for a PersistentVolume based on the pod name.
+// The suffix "-PV" is added to the pod name.
+func generatePVName(podName string) string {
+	return podName + "-pv"
+}
 
-	opts := zap.Options{
-		Development: true,
-	}
-	opts.BindFlags(flag.CommandLine)
-	flag.Parse()
+// Reconcile is the main controller function called each time an observed resource changes
+// or after the time specified in RequeueAfter has elapsed.
+// The function searches for pods in the Pending state that use PersistentVolumeClaims,
+// and creates appropriate PersistentVolumes for them.
+func (r *PersistentVolumeProvisionerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx)
 
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
-
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                server.Options{BindAddress: metricsAddr},
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "c67622b2.example.com",
-	})
-	if err != nil {
-		setupLog.Error(err, "unable to start manager")
-		os.Exit(1)
+	// Get the list of Pods in the entire cluster
+	podList := &corev1.PodList{}
+	if err := r.List(ctx, podList); err != nil {
+		logger.Error(err, "unable to list pods")
+		return ctrl.Result{}, err
 	}
 
-	// Create and register the controller
-	if err = (&controller.PersistentVolumeProvisionerReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		PvPath: pvPath,
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "PersistentVolumeProvisioner")
-		os.Exit(1)
-	}
-	// +kubebuilder:scaffold:builder
+	// We're only interested in Pending pods
+	for _, pod := range podList.Items {
+		if pod.Status.Phase != corev1.PodPending {
+			continue
+		}
 
-	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up health check")
-		os.Exit(1)
-	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
-		os.Exit(1)
+		for _, volume := range pod.Spec.Volumes {
+			if volume.PersistentVolumeClaim != nil {
+				pvcName := volume.PersistentVolumeClaim.ClaimName
+				namespace := pod.Namespace
+
+				pvc := &corev1.PersistentVolumeClaim{}
+				if err := r.Get(ctx, types.NamespacedName{
+					Name: pvcName, Namespace: namespace,
+				}, pvc); err != nil {
+					logger.Error(err, "unable to get PVC", "pvcName", pvcName)
+					continue
+				}
+
+				if pvc.Status.Phase == corev1.ClaimPending {
+					logger.Info("Found pending Pod needing PV",
+						"pod", pod.Name,
+						"pvc", pvcName)
+
+					// Check if PV already exists (e.g., after operator restart)
+					pvName := generatePVName(pod.Name)
+					existingPV := &corev1.PersistentVolume{}
+					err := r.Get(ctx, types.NamespacedName{Name: pvName}, existingPV)
+					if err == nil {
+						logger.Info("PV already exists", "pvName", pvName)
+						continue
+					}
+
+					// Create the PV
+					if err := r.createPersistentVolume(ctx, pod, *pvc); err != nil {
+						logger.Error(err, "failed to create PV", "pod", pod.Name)
+						continue
+					}
+
+					logger.Info("Successfully created PersistentVolume for PVC",
+						"pvName", pvName,
+						"pvcName", pvcName)
+				}
+			}
+		}
 	}
 
-	setupLog.Info("starting manager")
-	setupLog.Info("PV path configured", "path", pvPath)
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "problem running manager")
-		os.Exit(1)
+	// Reconcile every 15 seconds to check more frequently for new PVCs to handle
+	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
+}
+
+// createPersistentVolume creates a new PersistentVolume for the given pod and PVC.
+// The function generates an appropriate PV name, determines the path in the host filesystem,
+// and configures the PV to be bound to both the specific PVC and cluster node.
+//
+// Parameters:
+// - ctx: Context used for communication with the Kubernetes API
+// - pod: Pod for which the PV is being created
+// - pvc: PersistentVolumeClaim for which the PV is being created
+//
+// Returns an error if PV creation fails.
+func (r *PersistentVolumeProvisionerReconciler) createPersistentVolume(ctx context.Context, pod corev1.Pod, pvc corev1.PersistentVolumeClaim) error {
+	logger := log.FromContext(ctx)
+
+	// Generate PV name based on pod name
+	pvName := generatePVName(pod.Name)
+
+	// Extract release name from pod labels - default to pod name if not found
+	releaseName := "default"
+	if val, ok := pod.Labels["app.kubernetes.io/instance"]; ok {
+		releaseName = val
+	} else if val, ok := pod.Labels["release"]; ok {
+		releaseName = val
+	} else {
+		// Fallback to pod owner reference name if available
+		if len(pod.OwnerReferences) > 0 {
+			releaseName = pod.OwnerReferences[0].Name
+		} else {
+			// If no owner or label, use pod name as fallback
+			releaseName = pod.Name
+		}
 	}
+
+	// Create path in format: /hostParentPath/namespace/releaseName/pvName
+	var localPath string
+
+	// Check if every element of prefered path is avaiable
+	if r.PvPath != "" && pod.Namespace != "" && releaseName != "" && pod.Spec.Hostname != "" {
+		// Full path prefered
+		localPath = filepath.Join(r.PvPath, pod.Namespace, releaseName+"-"+pod.Spec.Hostname)
+		logger.Info("Using full path structure", "localPath", localPath)
+	} else {
+		// Fallback - dynamic path building with avaiable elements
+		if r.PvPath != "" {
+			localPath = r.PvPath
+
+			if pod.Namespace != "" {
+				localPath = filepath.Join(localPath, pod.Namespace)
+
+				if releaseName != "" && pod.Spec.Hostname != "" {
+					localPath = filepath.Join(localPath, releaseName+"-"+pod.Spec.Hostname)
+				} else if releaseName != "" {
+					localPath = filepath.Join(localPath, releaseName)
+				} else if pod.Spec.Hostname != "" {
+					localPath = filepath.Join(localPath, pod.Spec.Hostname)
+				}
+			}
+		} else {
+			localPath = "/k8s-storage"
+		}
+		logger.Info("Using partial path structure (fallback)", "localPath", localPath)
+	}
+
+	// Get storage class from PVC if specified
+	var storageClassName string
+	if pvc.Spec.StorageClassName != nil {
+		storageClassName = *pvc.Spec.StorageClassName
+	}
+
+	// Get requested storage from PVC
+	storageSize := pvc.Spec.Resources.Requests[corev1.ResourceStorage]
+
+	var nodeAffinity *corev1.VolumeNodeAffinity
+
+	// Check if every pod has node
+	if pod.Spec.NodeName != "" {
+		logger.Info("Adding NodeAffinity to PV", "nodeName", pod.Spec.NodeName)
+		nodeAffinity = &corev1.VolumeNodeAffinity{
+			Required: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					{
+						MatchExpressions: []corev1.NodeSelectorRequirement{
+							{
+								Key:      "kubernetes.io/hostname",
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   []string{pod.Spec.NodeName},
+							},
+						},
+					},
+				},
+			},
+		}
+	} else {
+		logger.Info("Pod doesn't have assigned node yet, creating PV without NodeAffinity", "pod", pod.Name)
+		// nodeAffinity pozostaje nil
+	}
+
+	// Create PV object
+	pv := &corev1.PersistentVolume{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: pvName,
+			Labels: map[string]string{
+				"created-by":    "pv-provisioner",
+				"pod-name":      pod.Name,
+				"pod-namespace": pod.Namespace,
+				"release-name":  releaseName,
+			},
+			Annotations: map[string]string{
+				"pv-provisioner.io/created-for-pvc": fmt.Sprintf("%s/%s", pvc.Namespace, pvc.Name),
+				"pv-provisioner.io/creation-time":   time.Now().Format(time.RFC3339),
+			},
+		},
+		Spec: corev1.PersistentVolumeSpec{
+
+			StorageClassName: storageClassName,
+			Capacity: corev1.ResourceList{
+				corev1.ResourceStorage: storageSize,
+			},
+			AccessModes:                   pvc.Spec.AccessModes,
+			PersistentVolumeReclaimPolicy: corev1.PersistentVolumeReclaimRetain,
+			PersistentVolumeSource: corev1.PersistentVolumeSource{
+				HostPath: &corev1.HostPathVolumeSource{
+					Path: localPath,
+					Type: hostPathTypePtr(corev1.HostPathDirectoryOrCreate),
+				},
+			},
+			ClaimRef: &corev1.ObjectReference{
+				Kind:       "PersistentVolumeClaim",
+				Namespace:  pvc.Namespace,
+				Name:       pvc.Name,
+				UID:        pvc.UID,
+				APIVersion: "v1",
+			},
+			NodeAffinity: nodeAffinity,
+		},
+	}
+
+	// Create the PV in Kubernetes
+	logger.Info("Creating PersistentVolume", "pvName", pvName, "path", localPath)
+	if err := r.Create(ctx, pv); err != nil {
+		if errors.IsAlreadyExists(err) {
+			logger.Info("PV already exists", "pvName", pvName)
+			return nil
+		}
+		return fmt.Errorf("failed to create PV: %w", err)
+	}
+
+	logger.Info("Successfully created PersistentVolume", "pvName", pvName)
+	return nil
+}
+
+// SetupWithManager configures the controller with the controller manager,
+// specifying which resource to watch (Pod) and setting the default path for PVs
+// if one hasn't been provided.
+func (r *PersistentVolumeProvisionerReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.PvPath == "" {
+		r.PvPath = "/k8s-storage"
+	}
+	return ctrl.NewControllerManagedBy(mgr).
+		For(&corev1.Pod{}).
+		Complete(r)
 }
