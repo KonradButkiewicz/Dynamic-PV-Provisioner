@@ -202,7 +202,7 @@ func (r *PersistentVolumeProvisionerReconciler) createPersistentVolume(ctx conte
 		}
 	} else {
 		logger.Info("Pod doesn't have assigned node yet, creating PV without NodeAffinity", "pod", pod.Name)
-		// nodeAffinity pozostaje nil
+		// nodeAffinity is nil
 	}
 
 	// Create PV object
